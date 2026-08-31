@@ -171,6 +171,11 @@ def main():
     last_frame_timestamp = 0.0
     rate_window_start = time.time()
 
+    # 每幀處理時間統計 (秒)
+    detect_time_sum = 0.0
+    proc_time_sum = 0.0
+    proc_time_max = 0.0
+
     try:
         while True:
             # 每 2 秒回報一次影像幀率與 MAVLink 發送頻率
@@ -179,9 +184,19 @@ def main():
             if elapsed >= 2.0:
                 fps = frame_count / elapsed
                 rate_hz = send_count / elapsed
-                print(f"[RATE] Camera FPS: {fps:.1f} | LANDING_TARGET send rate: {rate_hz:.1f} Hz")
+                if frame_count > 0:
+                    avg_detect_ms = detect_time_sum / frame_count * 1000.0
+                    avg_proc_ms = proc_time_sum / frame_count * 1000.0
+                    max_proc_ms = proc_time_max * 1000.0
+                    print(f"[RATE] Camera FPS: {fps:.1f} | LANDING_TARGET send rate: {rate_hz:.1f} Hz | "
+                          f"Proc avg: {avg_proc_ms:.1f}ms (detect {avg_detect_ms:.1f}ms) max: {max_proc_ms:.1f}ms")
+                else:
+                    print(f"[RATE] Camera FPS: {fps:.1f} | LANDING_TARGET send rate: {rate_hz:.1f} Hz")
                 frame_count = 0
                 send_count = 0
+                detect_time_sum = 0.0
+                proc_time_sum = 0.0
+                proc_time_max = 0.0
                 rate_window_start = now
 
             ret, frame = reader.read()
@@ -196,12 +211,15 @@ def main():
             last_frame_timestamp = reader.last_update_time
             frame_count += 1
 
+            proc_start = time.monotonic()
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
             if is_new_api:
                 corners, ids, _ = detector.detectMarkers(gray)
             else:
                 corners, ids, _ = aruco.detectMarkers(gray, dictionary, parameters=parameters)
+
+            detect_time_sum += time.monotonic() - proc_start
 
             target_to_use = None
 
@@ -236,6 +254,9 @@ def main():
 
                     # 濾除 35 米以上的異常值
                     if z_m > MAX_VALID_Z or z_m < 0.1:
+                        proc_time = time.monotonic() - proc_start
+                        proc_time_sum += proc_time
+                        proc_time_max = max(proc_time_max, proc_time)
                         continue
 
                     
@@ -270,6 +291,10 @@ def main():
                     print(" [WARNING] Target Lost! Stop sending MAVLink.")
                     print("==========================================")
                     target_was_found = False
+
+            proc_time = time.monotonic() - proc_start
+            proc_time_sum += proc_time
+            proc_time_max = max(proc_time_max, proc_time)
 
             # 新幀節流已由上方的時間戳檢查處理，這裡僅需短暫讓出 CPU
             time.sleep(0.005)
