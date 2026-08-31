@@ -192,27 +192,31 @@ def main():
                     )
 
                 if success:
+                    x_m = -float(tvec[1][0])
+                    y_m = float(tvec[0][0])
                     z_m = float(tvec[2][0])
 
                     # 濾除 35 米以上的異常值
                     if z_m > MAX_VALID_Z or z_m < 0.1:
                         continue
 
-                    # 單點去畸變中心投射
-                    u_raw = np.mean(img_points[:, 0])
-                    v_raw = np.mean(img_points[:, 1])
-                    raw_pt = np.array([[[u_raw, v_raw]]], dtype=np.float32)
                     
-                    if USE_FISHEYE:
-                        undist_pt = cv2.fisheye.undistortPoints(raw_pt, CAMERA_MATRIX, DIST_COEFFS)
-                    else:
-                        undist_pt = cv2.undistortPoints(raw_pt, CAMERA_MATRIX, DIST_COEFFS)
+                    # Comment out u_raw and v_raw... redundant calculation from tvec
+                    # 單點去畸變中心投射
+                    # u_raw = np.mean(img_points[:, 0])
+                    # v_raw = np.mean(img_points[:, 1])
+                    # raw_pt = np.array([[[u_raw, v_raw]]], dtype=np.float32)
+                    
+                    # if USE_FISHEYE:
+                    #     undist_pt = cv2.fisheye.undistortPoints(raw_pt, CAMERA_MATRIX, DIST_COEFFS)
+                    # else:
+                    #     undist_pt = cv2.undistortPoints(raw_pt, CAMERA_MATRIX, DIST_COEFFS)
                         
-                    norm_x = undist_pt[0][0][0]
-                    norm_y = undist_pt[0][0][1]
+                    # norm_x = undist_pt[0][0][0]
+                    # norm_y = undist_pt[0][0][1]
 
-                    y_m = float(norm_x * z_m)
-                    x_m = float(-norm_y * z_m)
+                    # y_m = float(norm_x * z_m)
+                    # x_m = float(-norm_y * z_m)
 
                     # 發送 MAVLink landing_target
                     send_landing_target(master, x=x_m, y=y_m, z=z_m)
