@@ -62,6 +62,7 @@ class NonBlockingRTSPReader:
         if self.cap is not None:
             self.cap.release()
         self.cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+        print(f"[SYSTEM] Camera FPS: {self.cap.get(cv2.CAP_PROP_FPS)}")
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     def _update_loop(self):
