@@ -67,6 +67,11 @@ class NonBlockingRTSPReader:
 
     def _update_loop(self):
         self._connect()
+
+        # 實際接收/解碼幀率統計（與主迴圈處理速度無關）
+        rx_count = 0
+        rx_start = time.monotonic()
+
         while not self.stopped:
             if not self.cap.isOpened():
                 time.sleep(0.5)
@@ -78,6 +83,14 @@ class NonBlockingRTSPReader:
                 with self.lock:
                     self.latest_frame = frame
                     self.last_update_time = time.time()
+
+                rx_count += 1
+                now = time.monotonic()
+                elapsed = now - rx_start
+                if elapsed >= 5.0:
+                    print(f"[RX] Receive/decode FPS: {rx_count / elapsed:.1f}", flush=True)
+                    rx_count = 0
+                    rx_start = now
             else:
                 if time.time() - self.last_update_time > 1.0:
                     time.sleep(0.2)
@@ -176,10 +189,12 @@ def main():
                 time.sleep(0.01)
                 continue
 
-            # 只在收到「新」影像幀時計數（read() 可能重複回傳同一幀）
-            if reader.last_update_time != last_frame_timestamp:
-                frame_count += 1
-                last_frame_timestamp = reader.last_update_time
+            # 只處理「新」影像幀，避免對同一快取幀重複偵測與發送
+            if reader.last_update_time == last_frame_timestamp:
+                time.sleep(0.005)
+                continue
+            last_frame_timestamp = reader.last_update_time
+            frame_count += 1
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
@@ -256,7 +271,8 @@ def main():
                     print("==========================================")
                     target_was_found = False
 
-            time.sleep(0.03)
+            # 新幀節流已由上方的時間戳檢查處理，這裡僅需短暫讓出 CPU
+            time.sleep(0.005)
 
     except KeyboardInterrupt:
         print("\n[SYSTEM] Terminating Precision Landing Daemon...")
