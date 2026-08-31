@@ -151,6 +151,10 @@ def main():
     target_was_found = False
     MAX_VALID_Z = 35.0  # 支援最高 35 米的高空識別
 
+    # MAVLink 發送頻率統計
+    send_count = 0
+    rate_window_start = time.time()
+
     try:
         while True:
             ret, frame = reader.read()
@@ -220,6 +224,7 @@ def main():
 
                     # 發送 MAVLink landing_target
                     send_landing_target(master, x=x_m, y=y_m, z=z_m)
+                    send_count += 1
                     
                     tag_type = "ID:0(Small)" if target_to_use == 0 else "ID:1(Large)"
                     print(f"[{tag_type}] Front: {x_m:.2f}m | Right: {y_m:.2f}m | Down(Z): {z_m:.2f}m")
@@ -231,6 +236,15 @@ def main():
                     print(" [WARNING] Target Lost! Stop sending MAVLink.")
                     print("==========================================")
                     target_was_found = False
+
+            # 每 2 秒回報一次實際發送頻率
+            now = time.time()
+            elapsed = now - rate_window_start
+            if elapsed >= 2.0:
+                rate_hz = send_count / elapsed
+                print(f"[RATE] LANDING_TARGET send rate: {rate_hz:.1f} Hz ({send_count} msgs / {elapsed:.1f}s)")
+                send_count = 0
+                rate_window_start = now
 
             time.sleep(0.03)
 
