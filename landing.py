@@ -151,16 +151,34 @@ def main():
     target_was_found = False
     MAX_VALID_Z = 35.0  # 支援最高 35 米的高空識別
 
-    # MAVLink 發送頻率統計
+    # MAVLink 發送頻率與影像幀率統計
     send_count = 0
+    frame_count = 0
+    last_frame_timestamp = 0.0
     rate_window_start = time.time()
 
     try:
         while True:
+            # 每 2 秒回報一次影像幀率與 MAVLink 發送頻率
+            now = time.time()
+            elapsed = now - rate_window_start
+            if elapsed >= 2.0:
+                fps = frame_count / elapsed
+                rate_hz = send_count / elapsed
+                print(f"[RATE] Camera FPS: {fps:.1f} | LANDING_TARGET send rate: {rate_hz:.1f} Hz")
+                frame_count = 0
+                send_count = 0
+                rate_window_start = now
+
             ret, frame = reader.read()
             if not ret or frame is None:
                 time.sleep(0.01)
                 continue
+
+            # 只在收到「新」影像幀時計數（read() 可能重複回傳同一幀）
+            if reader.last_update_time != last_frame_timestamp:
+                frame_count += 1
+                last_frame_timestamp = reader.last_update_time
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
@@ -236,15 +254,6 @@ def main():
                     print(" [WARNING] Target Lost! Stop sending MAVLink.")
                     print("==========================================")
                     target_was_found = False
-
-            # 每 2 秒回報一次實際發送頻率
-            now = time.time()
-            elapsed = now - rate_window_start
-            if elapsed >= 2.0:
-                rate_hz = send_count / elapsed
-                print(f"[RATE] LANDING_TARGET send rate: {rate_hz:.1f} Hz ({send_count} msgs / {elapsed:.1f}s)")
-                send_count = 0
-                rate_window_start = now
 
             time.sleep(0.03)
 
