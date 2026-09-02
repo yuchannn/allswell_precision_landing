@@ -9,6 +9,9 @@ from pymavlink import mavutil
 import time
 import math
 import threading
+import csv
+import traceback
+from datetime import datetime
 
 # ----------------- 2. 系統與相機參數設定 -----------------
 RTSP_URL = "rtsp://192.168.144.25:8554/main.264"
@@ -47,8 +50,9 @@ for tid, info in TARGETS.items():
 
 # ----------------- 4. RTSP 讀取器 -----------------
 class NonBlockingRTSPReader:
-    def __init__(self, url):
+    def __init__(self, url, logger=None):
         self.url = url
+        self.logger = logger
         self.cap = None
         self.latest_frame = None
         self.last_update_time = 0
@@ -62,7 +66,11 @@ class NonBlockingRTSPReader:
         if self.cap is not None:
             self.cap.release()
         self.cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
-        print(f"[SYSTEM] Camera FPS: {self.cap.get(cv2.CAP_PROP_FPS)}")
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        if self.logger:
+            self.logger.camera_connect(fps)
+        else:
+            print(f"[SYSTEM] Camera FPS: {fps}")
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     def _update_loop(self):
@@ -88,7 +96,11 @@ class NonBlockingRTSPReader:
                 now = time.monotonic()
                 elapsed = now - rx_start
                 if elapsed >= 5.0:
-                    print(f"[RX] Receive/decode FPS: {rx_count / elapsed:.1f}", flush=True)
+                    rx_msg = f"[RX] Receive/decode FPS: {rx_count / elapsed:.1f}"
+                    if self.logger:
+                        self.logger.event(rx_msg)
+                    else:
+                        print(rx_msg, flush=True)
                     rx_count = 0
                     rx_start = now
             else:
@@ -108,17 +120,252 @@ class NonBlockingRTSPReader:
         if self.cap and self.cap.isOpened():
             self.cap.release()
 
+# ----------------- 4.5 本地飛行日誌 -----------------
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+
+
+class FlightLogger:
+    """Per-run flight log on local disk. Never overwrites a previous run.
+
+    Creates two files under logs/:
+        landing_YYYYmmdd_HHMMSS[_N].log          events, rate reports, summary
+        landing_YYYYmmdd_HHMMSS[_N]_targets.csv  one row per LANDING_TARGET sent
+    """
+
+    def __init__(self):
+        os.makedirs(LOG_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = os.path.join(LOG_DIR, f"landing_{stamp}")
+        suffix = 0
+        while True:
+            candidate = base if suffix == 0 else f"{base}_{suffix}"
+            if not os.path.exists(candidate + ".log"):
+                break
+            suffix += 1
+        self.text_path = candidate + ".log"
+        self.csv_path = candidate + "_targets.csv"
+
+        self._lock = threading.Lock()
+        # line-buffered so data survives a power cut mid-flight
+        self._text = open(self.text_path, "w", buffering=1)
+        self._csv_file = open(self.csv_path, "w", buffering=1, newline="")
+        self._csv = csv.writer(self._csv_file)
+        self._csv.writerow([
+            "wall_time_iso", "t_rel_s", "tag_id",
+            "front_m", "right_m", "down_m",
+            "distance_m", "angle_x_rad", "angle_y_rad",
+            "detect_ms", "proc_ms",
+        ])
+
+        self._start_mono = time.monotonic()
+        self._start_wall = time.time()
+
+        # ---- aggregate statistics for the end-of-run summary ----
+        self._sends_total = 0
+        self._per_tag = {}                    # tag id -> n / z_min / z_max / z_sum
+        self._send_gap = {"n": 0, "sum": 0.0, "max": 0.0}
+        self._last_send_mono = None
+
+        self._tracks = 0
+        self._tracked_time = 0.0
+        self._track_durations = []
+        self._acquire_events = []             # (t_rel, tag, z)
+        self._loss_events = []                # (t_rel, tag, last z, duration)
+        self._handoffs = []                   # (t_rel, from tag, to tag, z)
+
+        self._frames_total = 0
+        self._detect_time_total = 0.0
+        self._proc_time_total = 0.0
+        self._proc_time_peak = 0.0
+
+        self._outliers = 0
+        self._outlier_z_min = None
+        self._outlier_z_max = None
+        self._pnp_failures = 0
+        self._camera_connects = 0
+
+        self.event(f"[LOG] Writing to {self.text_path}", console=False)
+
+    def _rel(self):
+        return time.monotonic() - self._start_mono
+
+    def event(self, message, console=True):
+        """Timestamped line in the log file; unchanged message on the console."""
+        with self._lock:
+            self._text.write(f"[{self._rel():9.2f}s] {message}\n")
+        if console:
+            print(message, flush=True)
+
+    def camera_connect(self, fps):
+        with self._lock:
+            self._camera_connects += 1
+        self.event(f"[SYSTEM] Camera FPS: {fps}")
+
+    def rate_report(self, message, window_s, frames, sends,
+                    detect_sum, proc_sum, proc_max):
+        self._frames_total += frames
+        self._detect_time_total += detect_sum
+        self._proc_time_total += proc_sum
+        self._proc_time_peak = max(self._proc_time_peak, proc_max)
+        self.event(message)
+
+    def target_sent(self, tag_id, x, y, z, distance, angle_x, angle_y,
+                    detect_s, proc_s):
+        now_mono = time.monotonic()
+        self._sends_total += 1
+        stats = self._per_tag.setdefault(
+            tag_id, {"n": 0, "z_min": z, "z_max": z, "z_sum": 0.0})
+        stats["n"] += 1
+        stats["z_min"] = min(stats["z_min"], z)
+        stats["z_max"] = max(stats["z_max"], z)
+        stats["z_sum"] += z
+        if self._last_send_mono is not None:
+            gap = now_mono - self._last_send_mono
+            if gap < 2.0:  # ignore pauses between separate tracks
+                self._send_gap["n"] += 1
+                self._send_gap["sum"] += gap
+                self._send_gap["max"] = max(self._send_gap["max"], gap)
+        self._last_send_mono = now_mono
+        self._csv.writerow([
+            datetime.now().isoformat(timespec="milliseconds"),
+            f"{self._rel():.3f}", tag_id,
+            f"{x:.4f}", f"{y:.4f}", f"{z:.4f}",
+            f"{distance:.4f}", f"{angle_x:.5f}", f"{angle_y:.5f}",
+            f"{detect_s * 1000:.2f}", f"{proc_s * 1000:.2f}",
+        ])
+
+    def track_acquired(self, tag_id, z):
+        self._tracks += 1
+        self._acquire_events.append((self._rel(), tag_id, z))
+        self.event(f"[TRACK] Target acquired: ID {tag_id} at Z={z:.2f} m")
+
+    def track_handoff(self, from_tag, to_tag, z):
+        self._handoffs.append((self._rel(), from_tag, to_tag, z))
+        self.event(f"[TRACK] Tag handoff ID {from_tag} -> ID {to_tag} at Z={z:.2f} m")
+
+    def track_lost(self, tag_id, last_z, duration):
+        self._tracked_time += duration
+        self._track_durations.append(duration)
+        self._loss_events.append((self._rel(), tag_id, last_z, duration))
+        self.event(
+            f"[TRACK] Target lost: ID {tag_id}, last Z={last_z:.2f} m, "
+            f"tracked {duration:.1f} s",
+            console=False,
+        )
+
+    def outlier_rejected(self, z):
+        self._outliers += 1
+        self._outlier_z_min = z if self._outlier_z_min is None else min(self._outlier_z_min, z)
+        self._outlier_z_max = z if self._outlier_z_max is None else max(self._outlier_z_max, z)
+
+    def pnp_failure(self):
+        self._pnp_failures += 1
+
+    def summary(self, open_track_tag=None, open_track_start_mono=None,
+                open_track_last_z=0.0):
+        # A track still active at shutdown counts toward tracked time.
+        if open_track_tag is not None and open_track_start_mono is not None:
+            self.track_lost(open_track_tag, open_track_last_z,
+                            time.monotonic() - open_track_start_mono)
+
+        run = self._rel()
+        lines = ["", "=" * 62, "PRECISION LANDING RUN SUMMARY", "=" * 62]
+        lines.append(f"Start:                 "
+                     f"{datetime.fromtimestamp(self._start_wall).isoformat(timespec='seconds')}")
+        lines.append(f"Duration:              {run:.1f} s")
+
+        fps = self._frames_total / run if run > 0 else 0.0
+        lines.append(f"Frames processed:      {self._frames_total} ({fps:.1f} fps avg)")
+        if self._frames_total:
+            lines.append(f"Detect time avg:       "
+                         f"{self._detect_time_total / self._frames_total * 1000:.1f} ms")
+            lines.append(f"Frame proc avg / max:  "
+                         f"{self._proc_time_total / self._frames_total * 1000:.1f} / "
+                         f"{self._proc_time_peak * 1000:.1f} ms")
+
+        lines.append("")
+        lines.append(f"LANDING_TARGET sent:   {self._sends_total}")
+        if run > 0:
+            lines.append(f"Avg rate (whole run):  {self._sends_total / run:.1f} Hz")
+        if self._tracked_time > 0:
+            lines.append(f"Avg rate (tracking):   "
+                         f"{self._sends_total / self._tracked_time:.1f} Hz")
+        if self._send_gap["n"]:
+            lines.append(f"Send interval:         "
+                         f"mean {self._send_gap['sum'] / self._send_gap['n'] * 1000:.1f} ms, "
+                         f"max {self._send_gap['max'] * 1000:.1f} ms")
+        for tag in sorted(self._per_tag):
+            s = self._per_tag[tag]
+            lines.append(f"  ID {tag}: {s['n']} msgs, "
+                         f"Z {s['z_min']:.2f} - {s['z_max']:.2f} m "
+                         f"(mean {s['z_sum'] / s['n']:.2f})")
+
+        lines.append("")
+        pct = self._tracked_time / run * 100 if run > 0 else 0.0
+        lines.append(f"Tracks:                {self._tracks} "
+                     f"({self._tracked_time:.1f} s tracked, {pct:.1f}% of run)")
+        if self._track_durations:
+            mean_track = sum(self._track_durations) / len(self._track_durations)
+            lines.append(f"Track duration:        mean {mean_track:.1f} s, "
+                         f"longest {max(self._track_durations):.1f} s")
+
+        def _capped(items, fmt):
+            shown = [fmt(item) for item in items[:30]]
+            if len(items) > 30:
+                shown.append(f"  ... and {len(items) - 30} more")
+            return shown
+
+        if self._acquire_events:
+            lines.append("Acquisitions:")
+            lines.extend(_capped(
+                self._acquire_events,
+                lambda e: f"  t={e[0]:7.1f}s  ID {e[1]}  Z={e[2]:.2f} m"))
+        if self._loss_events:
+            lines.append("Losses:")
+            lines.extend(_capped(
+                self._loss_events,
+                lambda e: f"  t={e[0]:7.1f}s  ID {e[1]}  last Z={e[2]:.2f} m  "
+                          f"after {e[3]:.1f} s"))
+        if self._handoffs:
+            lines.append("Handoffs:")
+            lines.extend(_capped(
+                self._handoffs,
+                lambda e: f"  t={e[0]:7.1f}s  ID {e[1]} -> ID {e[2]}  Z={e[3]:.2f} m"))
+
+        lines.append("")
+        outlier_txt = f"Outliers rejected:     {self._outliers}"
+        if self._outliers:
+            outlier_txt += (f" (Z {self._outlier_z_min:.2f} - "
+                            f"{self._outlier_z_max:.2f} m)")
+        lines.append(outlier_txt)
+        lines.append(f"solvePnP failures:     {self._pnp_failures}")
+        reconnects = max(0, self._camera_connects - 1)
+        lines.append(f"Camera connects:       {self._camera_connects} "
+                     f"(reconnects: {reconnects})")
+        lines.append("=" * 62)
+
+        block = "\n".join(lines)
+        with self._lock:
+            self._text.write(block + "\n")
+        print(block, flush=True)
+
+    def close(self):
+        with self._lock:
+            self._text.close()
+            self._csv_file.close()
+
+
 # ----------------- 5. MAVLink 發送 -----------------
-def connect_mavlink():
-    print(f"[MAVLink] Connecting to Pixhawk on {MAVLINK_PORT}...")
+def connect_mavlink(logger):
+    logger.event(f"[MAVLink] Connecting to Pixhawk on {MAVLINK_PORT}...")
     master = mavutil.mavlink_connection(
         MAVLINK_PORT, baud=MAVLINK_BAUD, source_system=255, source_component=190
     )
     msg = master.wait_heartbeat(timeout=5)
     if msg is None:
-        print("[MAVLink] 【警告】無法取得 Pixhawk 心跳包！")
+        logger.event("[MAVLink] 【警告】無法取得 Pixhawk 心跳包！")
     else:
-        print("[MAVLink] Heartbeat received successfully!")
+        logger.event("[MAVLink] Heartbeat received successfully!")
     return master
 
 def send_landing_target(master, x, y, z):
@@ -136,47 +383,67 @@ def send_landing_target(master, x, y, z):
         [1.0, 0.0, 0.0, 0.0],
         2, 1
     )
+    return distance, angle_x, angle_y
 
 # ----------------- 6. 主程式迴圈 -----------------
 def main():
-    master = connect_mavlink()
-    reader = NonBlockingRTSPReader(RTSP_URL)
+    logger = FlightLogger()
+    logger.event(
+        f"[SYSTEM] OpenCV {cv2.__version__} | RTSP: {RTSP_URL} | "
+        f"MAVLink: {MAVLINK_PORT} @ {MAVLINK_BAUD}",
+        console=False,
+    )
+    logger.event(
+        "[SYSTEM] Tags: " + ", ".join(
+            f"ID {tid} = {info['size']:.2f} m" for tid, info in sorted(TARGETS.items())
+        ),
+        console=False,
+    )
 
-    # 【防鬼影策略 1】：改用抗噪能力極強的 AprilTag (36h11) 字典
-    # 備註：若實體打印紙為 5x5_1000，請改用 aruco.DICT_5X5_1000
-    dictionary = aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_36h11)
-    
-    try:
-        parameters = aruco.DetectorParameters()
-        # 【防鬼影策略 2】：嚴格限制邊框錯誤率與輪廓近似度
-        parameters.maxErroneousBitsInBorderRate = 0.05 # 極度嚴格，杜絕誤判
-        parameters.polygonalApproxAccuracyRate = 0.02
-        
-        detector = aruco.ArucoDetector(dictionary, parameters)
-        is_new_api = True
-    except AttributeError:
-        parameters = aruco.DetectorParameters_create()
-        parameters.maxErroneousBitsInBorderRate = 0.05
-        parameters.polygonalApproxAccuracyRate = 0.02
-        is_new_api = False
-
-    print(f"[SYSTEM] ArduCopter Precision Landing Daemon Running (30m Altitude Ready)...")
-
-    target_was_found = False
-    MAX_VALID_Z = 35.0  # 支援最高 35 米的高空識別
-
-    # MAVLink 發送頻率與影像幀率統計
-    send_count = 0
-    frame_count = 0
-    last_frame_timestamp = 0.0
-    rate_window_start = time.time()
-
-    # 每幀處理時間統計 (秒)
-    detect_time_sum = 0.0
-    proc_time_sum = 0.0
-    proc_time_max = 0.0
+    reader = None
+    # 追蹤狀態：目前鎖定的標籤 ID (None = 未追蹤)
+    current_tag = None
+    track_start_mono = 0.0
+    track_last_z = 0.0
 
     try:
+        master = connect_mavlink(logger)
+        reader = NonBlockingRTSPReader(RTSP_URL, logger)
+
+        # 【防鬼影策略 1】：改用抗噪能力極強的 AprilTag (36h11) 字典
+        # 備註：若實體打印紙為 5x5_1000，請改用 aruco.DICT_5X5_1000
+        dictionary = aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_36h11)
+
+        try:
+            parameters = aruco.DetectorParameters()
+            # 【防鬼影策略 2】：嚴格限制邊框錯誤率與輪廓近似度
+            parameters.maxErroneousBitsInBorderRate = 0.05 # 極度嚴格，杜絕誤判
+            parameters.polygonalApproxAccuracyRate = 0.02
+
+            detector = aruco.ArucoDetector(dictionary, parameters)
+            is_new_api = True
+        except AttributeError:
+            parameters = aruco.DetectorParameters_create()
+            parameters.maxErroneousBitsInBorderRate = 0.05
+            parameters.polygonalApproxAccuracyRate = 0.02
+            is_new_api = False
+
+        logger.event("[SYSTEM] ArduCopter Precision Landing Daemon Running (30m Altitude Ready)...")
+
+        MAX_VALID_Z = 35.0  # 支援最高 35 米的高空識別
+        logger.event(f"[SYSTEM] Valid Z range: 0.1 - {MAX_VALID_Z} m", console=False)
+
+        # MAVLink 發送頻率與影像幀率統計
+        send_count = 0
+        frame_count = 0
+        last_frame_timestamp = 0.0
+        rate_window_start = time.time()
+
+        # 每幀處理時間統計 (秒)
+        detect_time_sum = 0.0
+        proc_time_sum = 0.0
+        proc_time_max = 0.0
+
         while True:
             # 每 2 秒回報一次影像幀率與 MAVLink 發送頻率
             now = time.time()
@@ -188,10 +455,12 @@ def main():
                     avg_detect_ms = detect_time_sum / frame_count * 1000.0
                     avg_proc_ms = proc_time_sum / frame_count * 1000.0
                     max_proc_ms = proc_time_max * 1000.0
-                    print(f"[RATE] Camera FPS: {fps:.1f} | LANDING_TARGET send rate: {rate_hz:.1f} Hz | "
-                          f"Proc avg: {avg_proc_ms:.1f}ms (detect {avg_detect_ms:.1f}ms) max: {max_proc_ms:.1f}ms")
+                    rate_msg = (f"[RATE] Camera FPS: {fps:.1f} | LANDING_TARGET send rate: {rate_hz:.1f} Hz | "
+                                f"Proc avg: {avg_proc_ms:.1f}ms (detect {avg_detect_ms:.1f}ms) max: {max_proc_ms:.1f}ms")
                 else:
-                    print(f"[RATE] Camera FPS: {fps:.1f} | LANDING_TARGET send rate: {rate_hz:.1f} Hz")
+                    rate_msg = f"[RATE] Camera FPS: {fps:.1f} | LANDING_TARGET send rate: {rate_hz:.1f} Hz"
+                logger.rate_report(rate_msg, elapsed, frame_count, send_count,
+                                   detect_time_sum, proc_time_sum, proc_time_max)
                 frame_count = 0
                 send_count = 0
                 detect_time_sum = 0.0
@@ -219,7 +488,8 @@ def main():
             else:
                 corners, ids, _ = aruco.detectMarkers(gray, dictionary, parameters=parameters)
 
-            detect_time_sum += time.monotonic() - proc_start
+            detect_s = time.monotonic() - proc_start
+            detect_time_sum += detect_s
 
             target_to_use = None
 
@@ -254,43 +524,40 @@ def main():
 
                     # 濾除 35 米以上的異常值
                     if z_m > MAX_VALID_Z or z_m < 0.1:
+                        logger.outlier_rejected(z_m)
                         proc_time = time.monotonic() - proc_start
                         proc_time_sum += proc_time
                         proc_time_max = max(proc_time_max, proc_time)
                         continue
 
-                    
-                    # Comment out u_raw and v_raw... redundant calculation from tvec
-                    # 單點去畸變中心投射
-                    # u_raw = np.mean(img_points[:, 0])
-                    # v_raw = np.mean(img_points[:, 1])
-                    # raw_pt = np.array([[[u_raw, v_raw]]], dtype=np.float32)
-                    
-                    # if USE_FISHEYE:
-                    #     undist_pt = cv2.fisheye.undistortPoints(raw_pt, CAMERA_MATRIX, DIST_COEFFS)
-                    # else:
-                    #     undist_pt = cv2.undistortPoints(raw_pt, CAMERA_MATRIX, DIST_COEFFS)
-                        
-                    # norm_x = undist_pt[0][0][0]
-                    # norm_y = undist_pt[0][0][1]
-
-                    # y_m = float(norm_x * z_m)
-                    # x_m = float(-norm_y * z_m)
+                    # 追蹤狀態事件：捕獲 / 標籤交接
+                    if current_tag is None:
+                        logger.track_acquired(target_to_use, z_m)
+                        track_start_mono = time.monotonic()
+                    elif current_tag != target_to_use:
+                        logger.track_handoff(current_tag, target_to_use, z_m)
+                    current_tag = target_to_use
+                    track_last_z = z_m
 
                     # 發送 MAVLink landing_target
-                    send_landing_target(master, x=x_m, y=y_m, z=z_m)
+                    distance, angle_x, angle_y = send_landing_target(master, x=x_m, y=y_m, z=z_m)
                     send_count += 1
-                    
+                    logger.target_sent(target_to_use, x_m, y_m, z_m,
+                                       distance, angle_x, angle_y,
+                                       detect_s, time.monotonic() - proc_start)
+
                     tag_type = "ID:0(Small)" if target_to_use == 0 else "ID:1(Large)"
                     print(f"[{tag_type}] Front: {x_m:.2f}m | Right: {y_m:.2f}m | Down(Z): {z_m:.2f}m")
-                    
-                    target_was_found = True
+                else:
+                    logger.pnp_failure()
             else:
-                if target_was_found:
+                if current_tag is not None:
+                    logger.track_lost(current_tag, track_last_z,
+                                      time.monotonic() - track_start_mono)
+                    current_tag = None
                     print("==========================================")
                     print(" [WARNING] Target Lost! Stop sending MAVLink.")
                     print("==========================================")
-                    target_was_found = False
 
             proc_time = time.monotonic() - proc_start
             proc_time_sum += proc_time
@@ -301,8 +568,19 @@ def main():
 
     except KeyboardInterrupt:
         print("\n[SYSTEM] Terminating Precision Landing Daemon...")
+        logger.event("[SYSTEM] Stopped by user (Ctrl+C)", console=False)
+    except Exception:
+        logger.event("[ERROR] Daemon crashed:\n" + traceback.format_exc(), console=False)
+        raise
     finally:
-        reader.stop()
+        if reader is not None:
+            reader.stop()
+        logger.summary(
+            open_track_tag=current_tag,
+            open_track_start_mono=track_start_mono if current_tag is not None else None,
+            open_track_last_z=track_last_z,
+        )
+        logger.close()
 
 if __name__ == '__main__':
     main()
