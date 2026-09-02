@@ -153,13 +153,15 @@ class FlightLogger:
         base = os.path.join(LOG_DIR, f"landing_{stamp}")
         suffix = 0
         while True:
-            candidate = base if suffix == 0 else f"{base}_{suffix}"
-            if not os.path.exists(candidate + ".log"):
+            run_dir = base if suffix == 0 else f"{base}_{suffix}"
+            if not os.path.exists(run_dir):
                 break
             suffix += 1
-        self.text_path = candidate + ".log"
-        self.csv_path = candidate + "_targets.csv"
-        self.summary_path = candidate + "_summary.txt"
+        os.makedirs(run_dir)
+        self.run_dir = run_dir
+        self.text_path = os.path.join(run_dir, "run.log")
+        self.csv_path = os.path.join(run_dir, "targets.csv")
+        self.summary_path = os.path.join(run_dir, "summary.txt")
 
         self._lock = threading.Lock()
         # line-buffered so data survives a power cut mid-flight
