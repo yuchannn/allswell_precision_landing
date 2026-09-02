@@ -58,6 +58,7 @@ class NonBlockingRTSPReader:
         self.last_update_time = 0
         self.stopped = False
         self.lock = threading.Lock()
+        self.new_frame_event = threading.Event()
         
         self.thread = threading.Thread(target=self._update_loop, daemon=True)
         self.thread.start()
@@ -91,6 +92,8 @@ class NonBlockingRTSPReader:
                 with self.lock:
                     self.latest_frame = frame
                     self.last_update_time = time.time()
+                # 喚醒等待新幀的主迴圈 (取代輪詢 + sleep)
+                self.new_frame_event.set()
 
                 rx_count += 1
                 now = time.monotonic()
@@ -109,11 +112,23 @@ class NonBlockingRTSPReader:
                     self._connect()
                 time.sleep(0.005)
 
-    def read(self):
+    def read_new(self, timeout=0.5):
+        """Block until a frame we have not consumed yet is available.
+
+        Returns (True, frame) as soon as the reader thread decodes one, or
+        (False, None) after `timeout` seconds without a new frame. The frame
+        is handed over by ownership (no copy): the reader always stores newly
+        allocated buffers, so the consumer can use it freely.
+        """
+        if not self.new_frame_event.wait(timeout):
+            return False, None
         with self.lock:
-            if self.latest_frame is None or time.time() - self.last_update_time > 0.5:
+            self.new_frame_event.clear()
+            frame = self.latest_frame
+            self.latest_frame = None
+            if frame is None:
                 return False, None
-            return True, self.latest_frame.copy()
+            return True, frame
 
     def stop(self):
         self.stopped = True
@@ -491,7 +506,6 @@ def main():
         # MAVLink 發送頻率與影像幀率統計
         send_count = 0
         frame_count = 0
-        last_frame_timestamp = 0.0
         rate_window_start = time.time()
 
         # 每幀處理時間統計 (秒)
@@ -523,16 +537,10 @@ def main():
                 proc_time_max = 0.0
                 rate_window_start = now
 
-            ret, frame = reader.read()
+            # 阻塞等待下一張「新」影像幀 (事件驅動，無輪詢延遲)
+            ret, frame = reader.read_new(timeout=0.5)
             if not ret or frame is None:
-                time.sleep(0.01)
                 continue
-
-            # 只處理「新」影像幀，避免對同一快取幀重複偵測與發送
-            if reader.last_update_time == last_frame_timestamp:
-                time.sleep(0.005)
-                continue
-            last_frame_timestamp = reader.last_update_time
             frame_count += 1
 
             proc_start = time.monotonic()
@@ -617,9 +625,6 @@ def main():
             proc_time = time.monotonic() - proc_start
             proc_time_sum += proc_time
             proc_time_max = max(proc_time_max, proc_time)
-
-            # 新幀節流已由上方的時間戳檢查處理，這裡僅需短暫讓出 CPU
-            time.sleep(0.005)
 
     except KeyboardInterrupt:
         print("\n[SYSTEM] Terminating Precision Landing Daemon...")
