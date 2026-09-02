@@ -144,6 +144,7 @@ class FlightLogger:
             suffix += 1
         self.text_path = candidate + ".log"
         self.csv_path = candidate + "_targets.csv"
+        self.summary_path = candidate + "_summary.txt"
 
         self._lock = threading.Lock()
         # line-buffered so data survives a power cut mid-flight
@@ -184,6 +185,9 @@ class FlightLogger:
         self._pnp_failures = 0
         self._camera_connects = 0
 
+        self._open_track = None          # [tag_id, start_mono, last_z] while tracking
+        self._last_checkpoint_mono = 0.0
+
         self.event(f"[LOG] Writing to {self.text_path}", console=False)
 
     def _rel(self):
@@ -208,6 +212,12 @@ class FlightLogger:
         self._proc_time_total += proc_sum
         self._proc_time_peak = max(self._proc_time_peak, proc_max)
         self.event(message)
+        # The battery is usually just pulled: force data onto the SD card every
+        # rate window (~2 s) and refresh the summary snapshot every ~10 s.
+        self._sync_to_disk()
+        if time.monotonic() - self._last_checkpoint_mono >= 10.0:
+            self._last_checkpoint_mono = time.monotonic()
+            self._write_checkpoint()
 
     def target_sent(self, tag_id, x, y, z, distance, angle_x, angle_y,
                     detect_s, proc_s):
@@ -219,6 +229,8 @@ class FlightLogger:
         stats["z_min"] = min(stats["z_min"], z)
         stats["z_max"] = max(stats["z_max"], z)
         stats["z_sum"] += z
+        if self._open_track is not None:
+            self._open_track[2] = z
         if self._last_send_mono is not None:
             gap = now_mono - self._last_send_mono
             if gap < 2.0:  # ignore pauses between separate tracks
@@ -237,21 +249,29 @@ class FlightLogger:
     def track_acquired(self, tag_id, z):
         self._tracks += 1
         self._acquire_events.append((self._rel(), tag_id, z))
+        self._open_track = [tag_id, time.monotonic(), z]
         self.event(f"[TRACK] Target acquired: ID {tag_id} at Z={z:.2f} m")
+        self._sync_to_disk()
 
     def track_handoff(self, from_tag, to_tag, z):
         self._handoffs.append((self._rel(), from_tag, to_tag, z))
+        if self._open_track is not None:
+            self._open_track[0] = to_tag
+            self._open_track[2] = z
         self.event(f"[TRACK] Tag handoff ID {from_tag} -> ID {to_tag} at Z={z:.2f} m")
+        self._sync_to_disk()
 
     def track_lost(self, tag_id, last_z, duration):
         self._tracked_time += duration
         self._track_durations.append(duration)
         self._loss_events.append((self._rel(), tag_id, last_z, duration))
+        self._open_track = None
         self.event(
             f"[TRACK] Target lost: ID {tag_id}, last Z={last_z:.2f} m, "
             f"tracked {duration:.1f} s",
             console=False,
         )
+        self._sync_to_disk()
 
     def outlier_rejected(self, z):
         self._outliers += 1
@@ -261,13 +281,52 @@ class FlightLogger:
     def pnp_failure(self):
         self._pnp_failures += 1
 
-    def summary(self, open_track_tag=None, open_track_start_mono=None,
-                open_track_last_z=0.0):
-        # A track still active at shutdown counts toward tracked time.
-        if open_track_tag is not None and open_track_start_mono is not None:
-            self.track_lost(open_track_tag, open_track_last_z,
-                            time.monotonic() - open_track_start_mono)
+    def _sync_to_disk(self):
+        """fsync both log files so data survives an abrupt battery disconnect."""
+        with self._lock:
+            try:
+                self._text.flush()
+                os.fsync(self._text.fileno())
+                self._csv_file.flush()
+                os.fsync(self._csv_file.fileno())
+            except (OSError, ValueError):
+                pass  # files already closed
 
+    def _write_checkpoint(self):
+        """Atomically refresh the on-disk summary snapshot (survives power cut)."""
+        tracked = self._tracked_time
+        if self._open_track is not None:
+            tracked += time.monotonic() - self._open_track[1]
+        header = [
+            "LATEST SUMMARY SNAPSHOT (refreshed every ~10 s while running).",
+            "If the battery was pulled, the .log file ends without a final",
+            "summary block - this file is the last state that reached the disk.",
+        ]
+        body = "\n".join(header + self._summary_lines(tracked)) + "\n"
+        tmp_path = self.summary_path + ".tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                f.write(body)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.summary_path)
+        except OSError:
+            pass
+
+    def summary(self):
+        # A track still active at shutdown counts toward tracked time.
+        if self._open_track is not None:
+            tag_id, start_mono, last_z = self._open_track
+            self.track_lost(tag_id, last_z, time.monotonic() - start_mono)
+
+        block = "\n".join(self._summary_lines(self._tracked_time))
+        with self._lock:
+            self._text.write(block + "\n")
+        print(block, flush=True)
+        self._sync_to_disk()
+        self._write_checkpoint()
+
+    def _summary_lines(self, tracked_time):
         run = self._rel()
         lines = ["", "=" * 62, "PRECISION LANDING RUN SUMMARY", "=" * 62]
         lines.append(f"Start:                 "
@@ -287,9 +346,9 @@ class FlightLogger:
         lines.append(f"LANDING_TARGET sent:   {self._sends_total}")
         if run > 0:
             lines.append(f"Avg rate (whole run):  {self._sends_total / run:.1f} Hz")
-        if self._tracked_time > 0:
+        if tracked_time > 0:
             lines.append(f"Avg rate (tracking):   "
-                         f"{self._sends_total / self._tracked_time:.1f} Hz")
+                         f"{self._sends_total / tracked_time:.1f} Hz")
         if self._send_gap["n"]:
             lines.append(f"Send interval:         "
                          f"mean {self._send_gap['sum'] / self._send_gap['n'] * 1000:.1f} ms, "
@@ -301,9 +360,9 @@ class FlightLogger:
                          f"(mean {s['z_sum'] / s['n']:.2f})")
 
         lines.append("")
-        pct = self._tracked_time / run * 100 if run > 0 else 0.0
+        pct = tracked_time / run * 100 if run > 0 else 0.0
         lines.append(f"Tracks:                {self._tracks} "
-                     f"({self._tracked_time:.1f} s tracked, {pct:.1f}% of run)")
+                     f"({tracked_time:.1f} s tracked, {pct:.1f}% of run)")
         if self._track_durations:
             mean_track = sum(self._track_durations) / len(self._track_durations)
             lines.append(f"Track duration:        mean {mean_track:.1f} s, "
@@ -343,11 +402,7 @@ class FlightLogger:
         lines.append(f"Camera connects:       {self._camera_connects} "
                      f"(reconnects: {reconnects})")
         lines.append("=" * 62)
-
-        block = "\n".join(lines)
-        with self._lock:
-            self._text.write(block + "\n")
-        print(block, flush=True)
+        return lines
 
     def close(self):
         with self._lock:
@@ -575,11 +630,7 @@ def main():
     finally:
         if reader is not None:
             reader.stop()
-        logger.summary(
-            open_track_tag=current_tag,
-            open_track_start_mono=track_start_mono if current_tag is not None else None,
-            open_track_last_z=track_last_z,
-        )
+        logger.summary()
         logger.close()
 
 if __name__ == '__main__':
