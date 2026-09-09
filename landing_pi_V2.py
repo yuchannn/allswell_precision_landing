@@ -49,6 +49,22 @@ for tid, info in TARGETS.items():
         [-h_size, -h_size, 0]
     ], dtype=np.float32)
 
+# ----------------- 2.5 深度 (Z) 估測參數 -----------------
+# solvePnP IPPE_SQUARE returns two candidate poses (plane-flip ambiguity).
+# When their reprojection errors are within this ratio the pose is ambiguous
+# and the size-based depth is preferred instead.
+PNP_AMBIGUITY_RATIO = 1.5
+# Best-solution reprojection error above this (px) means a poor fit: distrust PnP depth.
+PNP_MAX_REPROJ_PX = 2.0
+# Temporal gate: a new Z must be reachable from the last accepted Z at this
+# vertical speed, plus a relative noise allowance, as long as the last accepted
+# Z is recent. Both estimators failing the gate drops the frame.
+Z_MAX_RATE_MPS = 3.0
+Z_GATE_REL = 0.15
+Z_GATE_MAX_DT = 1.0
+# Cap on acquire/loss frame snapshots saved per run (protects the SD card).
+MAX_SAVED_FRAMES = 100
+
 # ----------------- 3. Picamera2 官方原生影像讀取器 -----------------
 class NonBlockingPiCameraReader:
     def __init__(self, width=1280, height=720, logger=None):
@@ -158,6 +174,7 @@ class FlightLogger:
             "front_m", "right_m", "down_m",
             "distance_m", "angle_x_rad", "angle_y_rad",
             "detect_ms", "proc_ms",
+            "raw_z_m", "stable_z_m", "z_source", "pnp_reproj_px", "pnp_ambiguity",
         ])
 
         self._start_mono = time.monotonic()
@@ -189,6 +206,18 @@ class FlightLogger:
         self._open_track = None
         self._last_checkpoint_mono = 0.0
 
+        # Z-estimator diagnostics
+        self._z_source_counts = {}
+        self._z_diff_sum = 0.0
+        self._z_diff_max = 0.0
+        self._z_diff_n = 0
+        self._pnp_ambiguous = 0
+        self._gate_rejections = 0
+
+        # acquire / loss frame snapshots
+        self.frames_dir = os.path.join(run_dir, "frames")
+        self._frames_saved = 0
+
         self.event(f"[LOG] Writing to {self.text_path}", console=False)
 
     def _rel(self):
@@ -216,9 +245,18 @@ class FlightLogger:
             self._last_checkpoint_mono = time.monotonic()
             self._write_checkpoint()
 
-    def target_sent(self, tag_id, x, y, z, distance, angle_x, angle_y, detect_s, proc_s):
+    def target_sent(self, tag_id, x, y, z, distance, angle_x, angle_y, detect_s, proc_s,
+                    raw_z=None, stable_z=None, z_source="", reproj_px=None, ambiguity=None):
         now_mono = time.monotonic()
         self._sends_total += 1
+        self._z_source_counts[z_source] = self._z_source_counts.get(z_source, 0) + 1
+        if raw_z is not None and stable_z is not None and not math.isnan(stable_z):
+            diff = abs(raw_z - stable_z)
+            self._z_diff_sum += diff
+            self._z_diff_max = max(self._z_diff_max, diff)
+            self._z_diff_n += 1
+        if ambiguity is not None and ambiguity < PNP_AMBIGUITY_RATIO:
+            self._pnp_ambiguous += 1
         stats = self._per_tag.setdefault(tag_id, {"n": 0, "z_min": z, "z_max": z, "z_sum": 0.0})
         stats["n"] += 1
         stats["z_min"] = min(stats["z_min"], z)
@@ -239,14 +277,21 @@ class FlightLogger:
             f"{x:.4f}", f"{y:.4f}", f"{z:.4f}",
             f"{distance:.4f}", f"{angle_x:.5f}", f"{angle_y:.5f}",
             f"{detect_s * 1000:.2f}", f"{proc_s * 1000:.2f}",
+            f"{raw_z:.4f}" if raw_z is not None else "",
+            f"{stable_z:.4f}" if stable_z is not None else "",
+            z_source,
+            f"{reproj_px:.3f}" if reproj_px is not None else "",
+            f"{ambiguity:.3f}" if ambiguity is not None else "",
         ])
 
-    def track_acquired(self, tag_id, z):
+    def track_acquired(self, tag_id, z, frame=None):
         self._tracks += 1
-        self._acquire_events.append((self._rel(), tag_id, z))
+        t_rel = self._rel()
+        self._acquire_events.append((t_rel, tag_id, z))
         self._open_track = [tag_id, time.monotonic(), z]
         self.event(f"[TRACK] Target acquired: ID {tag_id} at Z={z:.2f} m")
         self._sync_to_disk()
+        self.save_frame(frame, f"acquired_{t_rel:.1f}s_ID{tag_id}_Z{z:.1f}m.jpg")
 
     def track_handoff(self, from_tag, to_tag, z):
         self._handoffs.append((self._rel(), from_tag, to_tag, z))
@@ -256,13 +301,51 @@ class FlightLogger:
         self.event(f"[TRACK] Tag handoff ID {from_tag} -> ID {to_tag} at Z={z:.2f} m")
         self._sync_to_disk()
 
-    def track_lost(self, tag_id, last_z, duration):
+    def track_lost(self, tag_id, last_z, duration, last_seen_frame=None, current_frame=None):
         self._tracked_time += duration
         self._track_durations.append(duration)
-        self._loss_events.append((self._rel(), tag_id, last_z, duration))
+        t_rel = self._rel()
+        self._loss_events.append((t_rel, tag_id, last_z, duration))
         self._open_track = None
         self.event(f"[TRACK] Target lost: ID {tag_id}, last Z={last_z:.2f} m, tracked {duration:.1f} s", console=False)
         self._sync_to_disk()
+        stem = f"lost_{t_rel:.1f}s_ID{tag_id}_Z{last_z:.1f}m"
+        self.save_frame(last_seen_frame, f"{stem}_last_seen.jpg")
+        self.save_frame(current_frame, f"{stem}_current.jpg")
+
+    def z_gate_rejected(self, raw_z, stable_z, last_z, dt):
+        self._gate_rejections += 1
+        self.event(
+            f"[Z] Gate dropped frame: pnp={raw_z:.2f} m, size={stable_z:.2f} m, "
+            f"last accepted={last_z:.2f} m, dt={dt * 1000:.0f} ms",
+            console=False,
+        )
+
+    def save_frame(self, frame, name):
+        """Write a JPEG snapshot to <run_dir>/frames/ in the background (never stalls the loop)."""
+        if frame is None:
+            return
+        with self._lock:
+            if self._frames_saved >= MAX_SAVED_FRAMES:
+                return
+            self._frames_saved += 1
+        path = os.path.join(self.frames_dir, name)
+
+        def _write():
+            try:
+                os.makedirs(self.frames_dir, exist_ok=True)
+                ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                if not ok:
+                    raise RuntimeError("imencode failed")
+                with open(path, "wb") as f:
+                    f.write(encoded.tobytes())
+                    f.flush()
+                    os.fsync(f.fileno())
+            except Exception as e:
+                self.event(f"[FRAME] Failed to save {name}: {e}", console=False)
+
+        threading.Thread(target=_write, daemon=True).start()
+        self.event(f"[FRAME] Saved frames/{name}", console=False)
 
     def outlier_rejected(self, z):
         self._outliers += 1
@@ -359,6 +442,18 @@ class FlightLogger:
             lines.extend(_capped(self._handoffs, lambda e: f"  t={e[0]:7.1f}s  ID {e[1]} -> ID {e[2]}  Z={e[3]:.2f} m"))
 
         lines.append("")
+        lines.append("Z estimation:")
+        if self._z_source_counts:
+            lines.append("  Source of sent Z:     " + ", ".join(
+                f"{src} {n}" for src, n in sorted(self._z_source_counts.items())))
+        if self._z_diff_n:
+            lines.append(f"  |pnp - size|:         mean {self._z_diff_sum / self._z_diff_n:.2f} m, "
+                         f"max {self._z_diff_max:.2f} m")
+        lines.append(f"  PnP ambiguous frames: {self._pnp_ambiguous}")
+        lines.append(f"  Gate dropped frames:  {self._gate_rejections}")
+        lines.append(f"Frames saved:          {self._frames_saved} (frames/)")
+
+        lines.append("")
         outlier_txt = f"Outliers rejected:     {self._outliers}"
         if self._outliers:
             outlier_txt += f" (Z {self._outlier_z_min:.2f} - {self._outlier_z_max:.2f} m)"
@@ -405,6 +500,69 @@ def send_landing_target(master, x, y, z):
     )
     return distance, angle_x, angle_y
 
+# ----------------- 5.5 深度 (Z) 估測 -----------------
+def estimate_depth(img_points, obj_pts, tag_size, focal_length):
+    """Two independent depth estimates for one detected tag.
+
+    Returns (raw_z, stable_z, reproj_px, ambiguity):
+      raw_z      depth from the solvePnP (IPPE_SQUARE) solution with the lowest
+                 reprojection error, or None if solvePnP failed
+      stable_z   pinhole depth from the mean of both image diagonals (using both
+                 diagonals cancels most of the foreshortening from tilt)
+      reproj_px  reprojection error of the chosen PnP solution
+      ambiguity  2nd-best / best reprojection error; close to 1.0 means the two
+                 IPPE solutions (plane flip) are indistinguishable
+    """
+    d1 = np.linalg.norm(img_points[0] - img_points[2])
+    d2 = np.linalg.norm(img_points[1] - img_points[3])
+    diag_px = (d1 + d2) / 2.0
+    stable_z = (tag_size * math.sqrt(2) * focal_length) / diag_px if diag_px > 0 else float("nan")
+
+    count, rvecs, tvecs, errors = cv2.solvePnPGeneric(
+        obj_pts, img_points, CAMERA_MATRIX, DIST_COEFFS, flags=cv2.SOLVEPNP_IPPE_SQUARE
+    )
+    if not count or len(tvecs) == 0:
+        return None, stable_z, None, None
+
+    errors = np.asarray(errors, dtype=float).flatten()
+    best = int(np.argmin(errors))
+    raw_z = float(tvecs[best][2][0])
+    ambiguity = None
+    if len(errors) > 1:
+        second = float(np.sort(errors)[1])
+        ambiguity = second / errors[best] if errors[best] > 1e-9 else 1.0
+    return raw_z, stable_z, float(errors[best]), ambiguity
+
+
+def choose_depth(raw_z, stable_z, reproj_px, ambiguity, last_z, dt):
+    """Pick the depth to send. Returns (z, source); z is None when the frame should be dropped.
+
+    1. PnP is trusted only when its best solution is unambiguous and fits well;
+       otherwise the size-based estimate is preferred.
+    2. Temporal gate: if the last accepted Z is recent (dt <= Z_GATE_MAX_DT), a
+       candidate must be reachable at Z_MAX_RATE_MPS plus a relative noise
+       allowance. If the preferred estimator fails the gate the other one is
+       tried ("*_gated"); if both fail the frame is dropped ("gate").
+    """
+    pnp_trusted = (
+        reproj_px is not None
+        and reproj_px <= PNP_MAX_REPROJ_PX
+        and (ambiguity is None or ambiguity >= PNP_AMBIGUITY_RATIO)
+    )
+    if pnp_trusted:
+        candidates = [(raw_z, "pnp"), (stable_z, "size")]
+    else:
+        candidates = [(stable_z, "size"), (raw_z, "pnp")]
+
+    if last_z is None or dt is None or dt > Z_GATE_MAX_DT:
+        return candidates[0]
+
+    allowed = Z_MAX_RATE_MPS * dt + Z_GATE_REL * last_z
+    for i, (z, source) in enumerate(candidates):
+        if z is not None and not math.isnan(z) and abs(z - last_z) <= allowed:
+            return z, (source if i == 0 else source + "_gated")
+    return None, "gate"
+
 # ----------------- 6. 主程式迴圈 -----------------
 def main():
     logger = FlightLogger()
@@ -425,11 +583,15 @@ def main():
     current_tag = None
     track_start_mono = 0.0
     track_last_z = 0.0
+    last_seen_frame = None      # most recent frame with a valid detection (saved on loss)
+    last_z_accepted = None      # temporal gate state
+    last_z_mono = None
 
     fx = CAMERA_MATRIX[0, 0]
     fy = CAMERA_MATRIX[1, 1]
     cx = CAMERA_MATRIX[0, 2]
     cy = CAMERA_MATRIX[1, 2]
+    focal_length = (fx + fy) / 2.0
 
     try:
         reader = NonBlockingPiCameraReader(FRAME_WIDTH, FRAME_HEIGHT, logger)
@@ -454,6 +616,12 @@ def main():
 
         MAX_VALID_Z = 35.0
         logger.event(f"[SYSTEM] Valid Z range: 0.1 - {MAX_VALID_Z} m", console=False)
+        logger.event(
+            f"[SYSTEM] Z estimator: PnP trusted if ambiguity >= {PNP_AMBIGUITY_RATIO} and "
+            f"reproj <= {PNP_MAX_REPROJ_PX} px, else size-based (both diagonals); "
+            f"gate {Z_MAX_RATE_MPS} m/s + {Z_GATE_REL:.0%} within {Z_GATE_MAX_DT} s",
+            console=False,
+        )
 
         send_count = 0
         frame_count = 0
@@ -516,19 +684,25 @@ def main():
                 img_points = corners[index][0]
                 obj_pts = TARGETS[target_to_use]["obj_points"]
 
-                success, rvec, tvec = cv2.solvePnP(
-                    obj_pts, img_points, CAMERA_MATRIX, DIST_COEFFS, flags=cv2.SOLVEPNP_IPPE_SQUARE
+                raw_z, stable_z, reproj_px, ambiguity = estimate_depth(
+                    img_points, obj_pts, TARGETS[target_to_use]["size"], focal_length
                 )
 
-                if success:
-                    raw_z = float(tvec[2][0])
+                if raw_z is None:
+                    logger.pnp_failure()
+                else:
+                    now_mono = time.monotonic()
+                    dt_gate = (now_mono - last_z_mono) if last_z_mono is not None else None
+                    z_m, z_source = choose_depth(raw_z, stable_z, reproj_px, ambiguity,
+                                                 last_z_accepted, dt_gate)
 
-                    diag_px = np.linalg.norm(img_points[0] - img_points[2])
-                    tag_real_size = TARGETS[target_to_use]["size"]
-                    focal_length = (fx + fy) / 2.0
-                    stable_z = (tag_real_size * math.sqrt(2) * focal_length) / diag_px
-
-                    z_m = stable_z if abs(raw_z - stable_z) > 0.4 else raw_z
+                    if z_m is None:
+                        # Both estimators jumped implausibly since the last accepted Z.
+                        logger.z_gate_rejected(raw_z, stable_z, last_z_accepted, dt_gate)
+                        proc_time = time.monotonic() - proc_start
+                        proc_time_sum += proc_time
+                        proc_time_max = max(proc_time_max, proc_time)
+                        continue
 
                     if z_m > MAX_VALID_Z or z_m < 0.1:
                         logger.outlier_rejected(z_m)
@@ -547,27 +721,35 @@ def main():
                     x_m = float(z_m * math.tan(angle_y))
 
                     if current_tag is None:
-                        logger.track_acquired(target_to_use, z_m)
+                        logger.track_acquired(target_to_use, z_m, frame=frame)
                         track_start_mono = time.monotonic()
                     elif current_tag != target_to_use:
                         logger.track_handoff(current_tag, target_to_use, z_m)
                     current_tag = target_to_use
                     track_last_z = z_m
+                    last_seen_frame = frame
+                    last_z_accepted = z_m
+                    last_z_mono = now_mono
 
                     distance, angle_x_rad, angle_y_rad = send_landing_target(master, x=x_m, y=y_m, z=z_m)
                     send_count += 1
                     logger.target_sent(target_to_use, x_m, y_m, z_m,
                                        distance, angle_x_rad, angle_y_rad,
-                                       detect_s, time.monotonic() - proc_start)
+                                       detect_s, time.monotonic() - proc_start,
+                                       raw_z=raw_z, stable_z=stable_z, z_source=z_source,
+                                       reproj_px=reproj_px, ambiguity=ambiguity)
 
                     tag_type = "ID:0(Small)" if target_to_use == 0 else "ID:1(Large)"
-                    print(f"[{tag_type}] Front: {x_m:.2f}m | Right: {y_m:.2f}m | Down(Z): {z_m:.2f}m")
-                else:
-                    logger.pnp_failure()
+                    print(f"[{tag_type}] Front: {x_m:.2f}m | Right: {y_m:.2f}m | "
+                          f"Down(Z): {z_m:.2f}m [{z_source}]")
             else:
                 if current_tag is not None:
-                    logger.track_lost(current_tag, track_last_z, time.monotonic() - track_start_mono)
+                    logger.track_lost(current_tag, track_last_z, time.monotonic() - track_start_mono,
+                                      last_seen_frame=last_seen_frame, current_frame=frame)
                     current_tag = None
+                    last_seen_frame = None
+                    last_z_accepted = None
+                    last_z_mono = None
                     print("==========================================")
                     print(" [WARNING] Target Lost! Stop sending MAVLink.")
                     print("==========================================")
