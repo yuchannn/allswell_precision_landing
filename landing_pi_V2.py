@@ -32,22 +32,42 @@ DIST_COEFFS = np.array([
     [0.20590003614264327, -0.5582882506247375, -0.00026368475249116663, -7.103303081480804e-05, 0.4427011387711153]
 ], dtype=np.float32)
 
-# ----------------- 2. 雙標籤 (Nested Tag) 參數定義 -----------------
-# ID 0: 低空 AprilTag 小標籤 (10cm)
-# ID 1: 高空 AprilTag 大標籤 (80cm)
+# ----------------- 2. 多標籤 (Nested Tags) 參數定義 -----------------
+# Each tag: physical edge length + where its centre sits relative to the LANDING
+# POINT (pad centre). Tags may be placed off-centre; the drone is always steered
+# to the landing point, not to the tag.
+#
+# Pad frame used for "offset": look at the pad from above with the tags printed
+# upright, all in the SAME orientation.
+#   x = metres to the RIGHT of the landing point
+#   y = metres toward the TOP of the tags (up on the print)
+# A tag whose centre is 30 cm right and 20 cm up of the landing point has
+# offset (0.30, 0.20). Measure "size" as the outer edge of the black square on
+# the actual print (printers scale).
 TARGETS = {
-    0: {"size": 0.1, "obj_points": None},
-    1: {"size": 0.80, "obj_points": None}
+    0: {"size": 0.10, "offset": (0.0, 0.0)},     # 低空小標籤 at the landing point
+    1: {"size": 0.80, "offset": (0.0, 0.0)},     # 高空大標籤
+    2: {"size": 0.10, "offset": (0.30, 0.20)}, # example: off-centre small tag
+    # 3: {"size": 0.10, "offset": (-0.30, -0.20)},
 }
+
+# Which tag to use when several are visible: "smallest" (previous behaviour) or
+# "largest" (best range/bearing precision; smaller tags take over automatically
+# once the larger one leaves the frame).
+TAG_PRIORITY = "smallest"
 
 for tid, info in TARGETS.items():
     h_size = info["size"] / 2.0
-    info["obj_points"] = np.array([
-        [-h_size,  h_size, 0],
-        [ h_size,  h_size, 0],
-        [ h_size, -h_size, 0],
-        [-h_size, -h_size, 0]
+    info.setdefault("offset", (0.0, 0.0))
+    # Tag-frame corners: top-left, top-right, bottom-right, bottom-left,
+    # x right, y up (order required by SOLVEPNP_IPPE_SQUARE).
+    info["plane_pts"] = np.array([
+        [-h_size,  h_size],
+        [ h_size,  h_size],
+        [ h_size, -h_size],
+        [-h_size, -h_size]
     ], dtype=np.float32)
+    info["obj_points"] = np.hstack([info["plane_pts"], np.zeros((4, 1), dtype=np.float32)])
 
 # ----------------- 3. Picamera2 官方原生影像讀取器 -----------------
 class NonBlockingPiCameraReader:
@@ -405,6 +425,64 @@ def send_landing_target(master, x, y, z):
     )
     return distance, angle_x, angle_y
 
+# ----------------- 5.5 標籤 → 降落點 幾何 -----------------
+def _homography_from_corners(plane_pts, img_pts):
+    """3x3 homography mapping tag-plane coordinates (m) to pixels from 4 correspondences.
+
+    Solves the 8 linear DLT equations with h33 = 1:
+        u = (h11 x + h12 y + h13) / (h31 x + h32 y + 1)
+        v = (h21 x + h22 y + h23) / (h31 x + h32 y + 1)
+    """
+    A = np.zeros((8, 8), dtype=np.float64)
+    b = np.zeros(8, dtype=np.float64)
+    for i, ((x, y), (u, v)) in enumerate(zip(plane_pts, img_pts)):
+        A[2 * i] = [x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y]
+        b[2 * i] = u
+        A[2 * i + 1] = [0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y]
+        b[2 * i + 1] = v
+    h = np.linalg.solve(A, b)
+    return np.array([[h[0], h[1], h[2]],
+                     [h[3], h[4], h[5]],
+                     [h[6], h[7], 1.0]])
+
+
+def _apply_homography(H, point):
+    x, y = point
+    w = H[2, 0] * x + H[2, 1] * y + H[2, 2]
+    return ((H[0, 0] * x + H[0, 1] * y + H[0, 2]) / w,
+            (H[1, 0] * x + H[1, 1] * y + H[1, 2]) / w)
+
+
+def pad_center_pixel(img_points, target):
+    """Pixel where the LANDING POINT projects, computed from one tag's corners.
+
+    The four corners define the exact plane-to-image mapping, so any point of
+    the pad plane can be located in the image without recovering the (ambiguous)
+    3D pose. The landing point lies at -offset from the tag centre in the tag
+    frame; yaw and perspective are handled by the homography itself.
+    """
+    ox, oy = target["offset"]
+    try:
+        H = _homography_from_corners(target["plane_pts"], img_points)
+        return _apply_homography(H, (-ox, -oy))
+    except np.linalg.LinAlgError:
+        # Degenerate corners: fall back to the tag centroid (offset ignored).
+        return float(np.mean(img_points[:, 0])), float(np.mean(img_points[:, 1]))
+
+
+def select_target(ids):
+    """Return (tag id to use or None, list of all visible configured tag ids)."""
+    if ids is None:
+        return None, []
+    visible = set(int(i) for i in ids.flatten())
+    candidates = [tid for tid in TARGETS if tid in visible]
+    if not candidates:
+        return None, []
+    size_of = lambda tid: TARGETS[tid]["size"]
+    if TAG_PRIORITY == "largest":
+        return max(candidates, key=size_of), candidates
+    return min(candidates, key=size_of), candidates
+
 # ----------------- 6. 主程式迴圈 -----------------
 def main():
     logger = FlightLogger()
@@ -425,11 +503,21 @@ def main():
     current_tag = None
     track_start_mono = 0.0
     track_last_z = 0.0
+    last_pad_check_mono = 0.0   # rate limit for the multi-tag consistency report
 
     fx = CAMERA_MATRIX[0, 0]
     fy = CAMERA_MATRIX[1, 1]
     cx = CAMERA_MATRIX[0, 2]
     cy = CAMERA_MATRIX[1, 2]
+    focal_length = (fx + fy) / 2.0
+
+    logger.event(
+        f"[SYSTEM] Tags (size @ offset from landing point, priority={TAG_PRIORITY}): " + ", ".join(
+            f"ID {tid} {info['size'] * 100:.0f}cm @({info['offset'][0]:+.2f},{info['offset'][1]:+.2f})m"
+            for tid, info in sorted(TARGETS.items())
+        ),
+        console=False,
+    )
 
     try:
         reader = NonBlockingPiCameraReader(FRAME_WIDTH, FRAME_HEIGHT, logger)
@@ -502,14 +590,7 @@ def main():
             detect_s = time.monotonic() - proc_start
             detect_time_sum += detect_s
 
-            target_to_use = None
-
-            if ids is not None:
-                ids_flat = ids.flatten()
-                if 0 in ids_flat:
-                    target_to_use = 0
-                elif 1 in ids_flat:
-                    target_to_use = 1
+            target_to_use, visible_targets = select_target(ids)
 
             if target_to_use is not None:
                 index = np.where(ids.flatten() == target_to_use)[0][0]
@@ -525,7 +606,6 @@ def main():
 
                     diag_px = np.linalg.norm(img_points[0] - img_points[2])
                     tag_real_size = TARGETS[target_to_use]["size"]
-                    focal_length = (fx + fy) / 2.0
                     stable_z = (tag_real_size * math.sqrt(2) * focal_length) / diag_px
 
                     z_m = stable_z if abs(raw_z - stable_z) > 0.4 else raw_z
@@ -537,14 +617,34 @@ def main():
                         proc_time_max = max(proc_time_max, proc_time)
                         continue
 
-                    u = np.mean(img_points[:, 0])
-                    v = np.mean(img_points[:, 1])
+                    # Locate the LANDING POINT (not the tag centre) in the image via
+                    # this tag's plane homography: handles off-centre tags, yaw and
+                    # perspective exactly.
+                    u, v = pad_center_pixel(img_points, TARGETS[target_to_use])
 
                     angle_x = math.atan((u - cx) / fx)
                     angle_y = math.atan((cy - v) / fy)
 
                     y_m = float(z_m * math.tan(angle_x))
                     x_m = float(z_m * math.tan(angle_y))
+
+                    # Bench check for offsets: every visible tag must point at the same
+                    # landing point. Report the spread at most once per second.
+                    now_check = time.monotonic()
+                    if len(visible_targets) > 1 and now_check - last_pad_check_mono >= 1.0:
+                        last_pad_check_mono = now_check
+                        ids_flat = ids.flatten()
+                        estimates = np.array([
+                            pad_center_pixel(corners[np.where(ids_flat == tid)[0][0]][0], TARGETS[tid])
+                            for tid in visible_targets
+                        ])
+                        spread_px = float(np.max(np.linalg.norm(
+                            estimates[:, None, :] - estimates[None, :, :], axis=2)))
+                        logger.event(
+                            f"[PAD] Tags {sorted(visible_targets)} visible: landing-point estimates "
+                            f"spread {spread_px:.1f} px (~{spread_px * z_m / focal_length * 100:.1f} cm "
+                            f"at Z={z_m:.1f} m)"
+                        )
 
                     if current_tag is None:
                         logger.track_acquired(target_to_use, z_m)
@@ -560,7 +660,7 @@ def main():
                                        distance, angle_x_rad, angle_y_rad,
                                        detect_s, time.monotonic() - proc_start)
 
-                    tag_type = "ID:0(Small)" if target_to_use == 0 else "ID:1(Large)"
+                    tag_type = f"ID:{target_to_use}({TARGETS[target_to_use]['size'] * 100:.0f}cm)"
                     print(f"[{tag_type}] Front: {x_m:.2f}m | Right: {y_m:.2f}m | Down(Z): {z_m:.2f}m")
                 else:
                     logger.pnp_failure()
